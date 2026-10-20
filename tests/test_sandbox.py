@@ -166,3 +166,82 @@ def test_truncation_limit_exists() -> None:
     from plugin.plugins.code_sandbox.sandbox import MAX_OUTPUT_CHARS
 
     assert MAX_OUTPUT_CHARS == 50000
+
+
+# ══════════ v0.1.1：危险根限定（去误伤）+ 逃逸防护 + 入口注册 ══════════
+
+
+def test_audit_allows_pure_data_methods() -> None:
+    """纯计算数据结构的同名属性不得误伤：list.remove / dict.update / str.join 放行（v0.1.1）。"""
+    from plugin.plugins.code_sandbox.sandbox import audit_code
+
+    audit_code(
+        "a = [1, 2, 3]\n"
+        "a.remove(1)\n"
+        "d = {'x': 1}\n"
+        "d.update({'y': 2})\n"
+        "print(a, d, '|'.join(['a', 'b']))\n"
+    )
+
+
+def test_audit_blocks_os_remove() -> None:
+    """危险根对象的同名属性仍拦截：os.remove（v0.1.1 危险根限定后不绕过）。"""
+    from plugin.plugins.code_sandbox.sandbox import SandboxViolation, audit_code
+
+    with pytest.raises(SandboxViolation, match="remove"):
+        audit_code("import os\nos.remove('x.txt')\n")
+
+
+def test_audit_blocks_tempfile_import() -> None:
+    """tempfile 加入禁导入清单，防 mkdtemp/mkstemp 写文件系统（v0.1.1 审计发现）。"""
+    from plugin.plugins.code_sandbox.sandbox import SandboxViolation, audit_code
+
+    with pytest.raises(SandboxViolation, match="tempfile"):
+        audit_code("import tempfile\n")
+
+
+def test_audit_blocks_escape_chain() -> None:
+    """Python 沙箱经典逃逸链属性一律拦截（v0.1.1 加固）。"""
+    from plugin.plugins.code_sandbox.sandbox import SandboxViolation, audit_code
+
+    with pytest.raises(SandboxViolation, match="__class__"):
+        audit_code("().__class__.__mro__\n")
+    with pytest.raises(SandboxViolation, match="__subclasses__"):
+        audit_code("().__class__.__base__.__subclasses__()\n")
+
+
+def test_entry_registered() -> None:
+    """plugin_entry run 入口可被宿主收集（入口点 > 0，v0.1.1 修复）。"""
+    from plugin.plugins.code_sandbox import CodeSandboxPlugin
+
+    metas = []
+    for name in dir(CodeSandboxPlugin):
+        if name.startswith("_"):
+            continue
+        meta = getattr(getattr(CodeSandboxPlugin, name, None), "__neko_event_meta__", None)
+        if meta is not None and getattr(meta, "event_type", None) == "plugin_entry":
+            metas.append(meta)
+    assert any(m.id == "run" for m in metas), f"缺少入口 run，现有：{[m.id for m in metas]}"
+
+
+def test_entry_run_executes() -> None:
+    """入口 run：真实执行纯计算代码（无 Key 依赖，走子进程）。"""
+    import asyncio
+
+    from plugin.plugins.code_sandbox import CodeSandboxPlugin
+
+    inst = CodeSandboxPlugin.__new__(CodeSandboxPlugin)
+    result = asyncio.run(inst.entry_run(code="print(6 * 7)\n", parameters={}))
+    assert result["is_error"] is False
+    assert "42" in result["output"]
+
+
+def test_entry_run_empty_code() -> None:
+    import asyncio
+
+    from plugin.plugins.code_sandbox import CodeSandboxPlugin
+
+    inst = CodeSandboxPlugin.__new__(CodeSandboxPlugin)
+    result = asyncio.run(inst.entry_run(code="", parameters={}))
+    assert result["is_error"] is True
+    assert result["error"] == "NO_CODE"

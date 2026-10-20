@@ -38,7 +38,7 @@ _BLOCKED_MODULES = {
     "tkinter", "webbrowser", "ftplib", "smtplib", "telnetlib", "xmlrpc",
     "zipfile", "tarfile", "gzip", "bz2", "lzma", "zlib", "codecs", "tokenize",
     "dis", "inspect", "signal", "fcntl", "mmap", "resource", "pwd", "grp",
-    "curses", "termios", "tty", "pty", "cgi", "wsgiref", "email",
+    "curses", "termios", "tty", "pty", "cgi", "wsgiref", "email", "tempfile",
 }
 
 # 禁止调用的内置/属性名（AST Name / Attribute 匹配）
@@ -55,10 +55,34 @@ _BLOCKED_ATTRS = {
     "sendto", "sendall", "bind", "listen", "accept", "write_text", "write_bytes",
     "unlink", "rmtree", "remove", "rename", "replace", "mkdir", "makedirs",
     "symlink", "read_text", "read_bytes", "listdir", "walk", "scandir",
-    "startfile", "sleep",
+    "startfile", "sleep", "mkdtemp", "mkstemp", "NamedTemporaryFile",
     # 危险内置以属性形式访问（__builtins__.open / .eval 等）
     "open", "exec", "eval", "compile", "input", "breakpoint",
 }
+
+# Python 沙箱经典逃逸链属性（任何对象访问都拦截，不受危险根限定）
+_ESCAPE_ATTRS = {
+    "__class__", "__bases__", "__mro__", "__subclasses__", "__globals__",
+    "__builtins__", "__code__", "__closure__", "__dict__", "__getattribute__",
+    "__self__", "__func__", "__init__", "__new__",
+}
+
+# 属性拦截只作用于这些"危险根对象"上，避免误伤纯计算数据结构的同名属性
+# （如 list.remove / dict.update 等合法操作）；time 仅针对 sleep 等阻塞属性。
+_DANGEROUS_ROOTS = _BLOCKED_MODULES | {
+    "Path", "time", "builtins", "__builtins__", "tempfile",
+}
+
+
+def _root_name(node) -> str | None:
+    """取属性链的最左根名：os.system→os；Path('x').write_text→Path；a.b.c→a。"""
+    while isinstance(node, ast.Attribute):
+        node = node.value
+    if isinstance(node, ast.Call):
+        node = node.func
+    if isinstance(node, ast.Name):
+        return node.id
+    return None
 
 # 允许导入的标准库白名单
 _ALLOWED_MODULES = {
@@ -110,12 +134,16 @@ class _SandboxVisitor(ast.NodeVisitor):
             self.violations.append(f"禁止调用: {node.func.id}()")
         if isinstance(node.func, ast.Attribute):
             attr = node.func.attr
-            if attr in _BLOCKED_ATTRS:
+            if attr in _BLOCKED_ATTRS and _root_name(node.func.value) in _DANGEROUS_ROOTS:
                 self.violations.append(f"禁止属性调用: .{attr}()")
+            elif attr in _ESCAPE_ATTRS:
+                self.violations.append(f"禁止访问逃逸属性: .{attr}")
         self.generic_visit(node)
 
     def visit_Attribute(self, node: ast.Attribute) -> None:
-        if node.attr in _BLOCKED_ATTRS:
+        if node.attr in _ESCAPE_ATTRS:
+            self.violations.append(f"禁止访问逃逸属性: .{node.attr}")
+        elif node.attr in _BLOCKED_ATTRS and _root_name(node.value) in _DANGEROUS_ROOTS:
             self.violations.append(f"禁止访问属性: .{node.attr}")
         self.generic_visit(node)
 
